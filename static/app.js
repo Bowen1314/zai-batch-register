@@ -134,6 +134,8 @@ function handleWsMessage(msg) {
     case "INIT":
       tasks = msg.tasks || [];
       config = msg.config || {};
+      isBatchRunning = Boolean(msg.running);
+      updateBatchControls(msg.concurrency);
       renderTasks();
       updateStats();
       populateConfigForm();
@@ -598,9 +600,24 @@ async function submitBatchAdd() {
 }
 
 // Batch Actions
+async function taskAction(url, options) {
+  try {
+    const response = await fetch(url, options);
+    if (!response.ok) {
+      const body = await response.json();
+      const detail = Array.isArray(body.detail)
+        ? body.detail.map(item => item.msg).join("；")
+        : body.detail || body.message || "任务操作失败";
+      showToast(detail, "error");
+    }
+  } catch (error) {
+    showToast(error.message || "网络请求失败", "error");
+  }
+}
+
 async function startBatch() {
   const conc = parseInt(document.getElementById("concurrencyInput").value) || 2;
-  await fetch("/api/tasks/start", {
+  await taskAction("/api/tasks/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ concurrency: conc })
@@ -608,12 +625,12 @@ async function startBatch() {
 }
 
 async function pauseBatch() {
-  await fetch("/api/tasks/pause", { method: "POST" });
+  await taskAction("/api/tasks/pause", { method: "POST" });
 }
 
 async function clearTasks(type) {
   if (confirm(`确定要清空${type === 'completed' ? '已完成' : '所有'}任务吗？`)) {
-    await fetch("/api/tasks/clear", {
+    await taskAction("/api/tasks/clear", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(type)
@@ -622,11 +639,11 @@ async function clearTasks(type) {
 }
 
 async function retryTask(taskId) {
-  await fetch(`/api/tasks/${taskId}/retry`, { method: "POST" });
+  await taskAction(`/api/tasks/${taskId}/retry`, { method: "POST" });
 }
 
 async function deleteTask(taskId) {
-  await fetch(`/api/tasks/${taskId}`, { method: "DELETE" });
+  await taskAction(`/api/tasks/${taskId}`, { method: "DELETE" });
 }
 
 // Manual verify modal
@@ -822,15 +839,15 @@ async function testEmailConnection() {
     resultDiv.classList.remove("hidden");
     if (res.success) {
       resultDiv.className = "p-3 rounded-lg text-xs bg-emerald-50 text-emerald-800 border border-emerald-200";
-      resultDiv.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-600 mr-1.5"></i> ${res.message}`;
+      resultDiv.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-600 mr-1.5"></i> ${escapeHtml(res.message)}`;
     } else {
       resultDiv.className = "p-3 rounded-lg text-xs bg-rose-50 text-rose-800 border border-rose-200";
-      resultDiv.innerHTML = `<i class="fa-solid fa-circle-xmark text-rose-600 mr-1.5"></i> ${res.message}`;
+      resultDiv.innerHTML = `<i class="fa-solid fa-circle-xmark text-rose-600 mr-1.5"></i> ${escapeHtml(res.message)}`;
     }
   } catch (err) {
     resultDiv.classList.remove("hidden");
     resultDiv.className = "p-3 rounded-lg text-xs bg-rose-50 text-rose-800 border border-rose-200";
-    resultDiv.innerHTML = `<i class="fa-solid fa-circle-xmark text-rose-600 mr-1.5"></i> 网络请求异常: ${err.message}`;
+    resultDiv.innerHTML = `<i class="fa-solid fa-circle-xmark text-rose-600 mr-1.5"></i> 网络请求异常: ${escapeHtml(err.message)}`;
   } finally {
     btn.disabled = false;
     btn.innerHTML = `<i class="fa-solid fa-plug"></i> 测试连接并读取收件箱`;

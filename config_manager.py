@@ -3,31 +3,13 @@ import os
 import tempfile
 from threading import RLock
 from typing import Dict, Any, List
+from config_schema import AppConfig
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 TASKS_FILE = os.path.join(os.path.dirname(__file__), "tasks.json")
 _storage_lock = RLock()
 
-DEFAULT_CONFIG = {
-    "imap_host": "",
-    "imap_port": 993,
-    "imap_ssl": True,
-    "imap_user": "",
-    "imap_pass": "",
-    "imap_folder": "INBOX",
-    "headless": True,  # True for silent background headless execution, with WebUI interactive screencast
-    "captcha_timeout_sec": 120,
-    "email_poll_timeout_sec": 90,
-    "default_password": "",
-    "auto_verify_email": True,
-    "concurrency": 2,
-    "proxy_enabled": False,
-    "proxy_strategy": "round_robin",
-    "proxy_pool": "",
-    "proxy_server": "",
-    "proxy_username": "",
-    "proxy_password": ""
-}
+DEFAULT_CONFIG = AppConfig().model_dump()
 
 def _load_json(path: str, default: Any) -> Any:
     try:
