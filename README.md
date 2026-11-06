@@ -1,4 +1,4 @@
-# Z.ai 批量自动化注册与 Coding Plan 凭证提取工作台 (WebUI)
+# Z.ai 批量自动化注册与 Coding Plan 凭证提取工作台 (WebUI) / Zcode注册机
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688.svg)](https://fastapi.tiangolo.com/)
