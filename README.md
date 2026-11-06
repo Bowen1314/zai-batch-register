@@ -151,6 +151,19 @@ zai-batch-register/
 
 ---
 
+## 本地状态与回归测试
+
+服务启动时从 `config.json` 和 `tasks.json` 载入状态，运行期间任务列表由内存中的工作对象管理；直接编辑 `tasks.json` 后需要重启服务才能生效。重启会将中断的任务（包括等待邮件的任务）恢复为待执行。
+
+配置和任务采用同目录临时文件、文件同步及原子替换进行保存，序列化或替换失败时保留原文件。文件缺失时使用默认值；JSON 损坏、结构错误或读取权限不足时会报错，请修复文件或恢复备份后重启，避免静默覆盖已有数据。此机制面向单进程运行，请勿使用多个 Uvicorn worker 共享这些 JSON 文件。
+
+安装测试依赖并运行本地 HTTP、WebSocket 及存储回归测试（无需启动 Chromium，也不会访问 Z.ai）：
+
+```bash
+pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+```
+
 ## 📄 开源许可证
 
 本项目基于 [MIT License](LICENSE) 开源。
