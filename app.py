@@ -6,17 +6,22 @@ import time
 import csv
 import io
 import re
+import json
+import base64
+import binascii
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from config_manager import load_config, save_config, load_tasks, save_tasks
 from email_service import EmailService
 from register_worker import RegisterWorker
+from config_schema import AppConfig, BatchStartRequest
+from http_client import request_json
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
@@ -48,6 +53,30 @@ save_lock = asyncio.Lock()
 captcha_lock = asyncio.Lock()
 latest_captcha_frames: Dict[str, str] = {}
 batch_queue_task: Optional[asyncio.Task] = None
+scheduled_task_ids: set[str] = set()
+active_task_ids: set[str] = set()
+running_concurrency = 0
+ACTIVE_STATUSES = {"RUNNING", "VERIFYING", "WAITING_CAPTCHA", "QUEUED_CAPTCHA", "QUEUED", "WAITING_EMAIL"}
+
+
+def validated_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return AppConfig.model_validate(data).model_dump()
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors(include_input=False, include_context=False)) from exc
+
+
+def ensure_batch_running(concurrency: int) -> bool:
+    global batch_queue_task, is_running_batch, stop_requested, running_concurrency
+    if batch_queue_task is not None and not batch_queue_task.done():
+        stop_requested = False
+        return False
+    # Reserve the queue before yielding, so concurrent requests reuse its handle.
+    stop_requested = False
+    is_running_batch = True
+    running_concurrency = concurrency
+    batch_queue_task = asyncio.create_task(run_batch_queue(concurrency))
+    return True
 
 def get_email_service() -> EmailService:
     cfg = load_config()
@@ -113,7 +142,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     active_websockets.append(websocket)
     try:
-        await websocket.send_json({"type": "INIT", "tasks": tasks, "config": get_masked_config()})
+        await websocket.send_json({"type": "INIT", "tasks": tasks, "config": get_masked_config(), "running": is_running_batch, "concurrency": running_concurrency})
 
         # Synchronize a new viewer without replacing objects held by active workers.
         for tid in list(active_cdp_sessions.keys()):
@@ -178,7 +207,7 @@ async def update_config_api(data: Dict[str, Any] = Body(...)):
         data["imap_pass"] = current.get("imap_pass", "")
     if data.get("proxy_password") == "******":
         data["proxy_password"] = current.get("proxy_password", "")
-    save_config(data)
+    save_config(validated_config({**current, **data}))
     config = load_config()
     await broadcast("CONFIG_UPDATED", get_masked_config())
     return {"success": True, "config": get_masked_config()}
@@ -294,6 +323,7 @@ class BatchAddRequest(BaseModel):
 
 @app.post("/api/tasks/add")
 async def add_tasks_api(req: BatchAddRequest):
+    cfg = validated_config(load_config())
     lines = [line.strip() for line in req.batch_text.splitlines() if line.strip()]
     added = []
     existing_emails = {t["email"].lower() for t in tasks}
@@ -306,7 +336,7 @@ async def add_tasks_api(req: BatchAddRequest):
         parts = [p.strip() for p in line_str.replace("，", ",").split(",")]
         name = ""
         email = ""
-        pwd = req.default_password or ""
+        pwd = req.default_password or cfg["default_password"]
         
         if len(parts) == 1:
             raw = parts[0]
@@ -346,7 +376,7 @@ async def add_tasks_api(req: BatchAddRequest):
         existing_emails.add(email.lower())
             
         if not pwd:
-            pwd = "Password123!@#"
+            pwd = generate_random_password()
             
         task_id = f"task_{secrets.token_hex(4)}"
         task = {
@@ -365,21 +395,21 @@ async def add_tasks_api(req: BatchAddRequest):
     await broadcast("TASKS_ADDED", added)
 
     # 若勾选了自动启动
-    global is_running_batch, stop_requested
-    if req.auto_start and not is_running_batch:
-        stop_requested = False
-        cfg = load_config()
-        concurrency = int(cfg.get("concurrency") or 2)
-        asyncio.create_task(run_batch_queue(concurrency))
+    if req.auto_start and added:
+        scheduled_task_ids.update(t["id"] for t in added)
+        ensure_batch_running(cfg["concurrency"])
 
     return {"success": True, "count": len(added), "auto_started": bool(req.auto_start)}
 
 @app.post("/api/tasks/clear")
 async def clear_tasks_api(clear_type: str = Body(default="all")):
     global tasks
+    if clear_type != "completed" and active_task_ids:
+        raise HTTPException(status_code=409, detail="正在执行任务，请暂停并等待当前任务结束后清空")
     if clear_type == "completed":
         tasks = [t for t in tasks if t.get("status") not in ["SUCCESS", "FAILED"]]
     else:
+        scheduled_task_ids.clear()
         tasks = []
     save_tasks(tasks)
     await broadcast("TASKS_CLEARED", {"tasks": tasks})
@@ -388,29 +418,25 @@ async def clear_tasks_api(clear_type: str = Body(default="all")):
 @app.delete("/api/tasks/{task_id}")
 async def delete_task_api(task_id: str):
     global tasks
+    if task_id in active_task_ids:
+        raise HTTPException(status_code=409, detail="任务正在执行，暂不能删除")
+    scheduled_task_ids.discard(task_id)
     tasks = [t for t in tasks if t["id"] != task_id]
     save_tasks(tasks)
     await broadcast("TASK_DELETED", {"task_id": task_id})
     return {"success": True}
 
 async def run_batch_queue(concurrency: int = 2):
-    global is_running_batch, stop_requested
-    is_running_batch = True
-    stop_requested = False
-    
-    cfg = load_config()
-    email_svc = get_email_service()
-    concurrency_limit = max(1, min(10, concurrency))
-    
-    await broadcast("BATCH_STATUS", {"running": True, "concurrency": concurrency_limit})
-    sync_log_callback("SYSTEM", f"🚀 批量流水线已启动 (并发通道数: {concurrency_limit})...", "info")
+    global is_running_batch, batch_queue_task, running_concurrency
     
     async def worker_loop(worker_idx: int):
         while not stop_requested:
             task_to_run = None
             async with save_lock:
                 for t in tasks:
-                    if t["status"] in ["PENDING"]:
+                    if t["id"] in scheduled_task_ids and t["id"] not in active_task_ids and t["status"] == "PENDING":
+                        scheduled_task_ids.discard(t["id"])
+                        active_task_ids.add(t["id"])
                         t["status"] = "QUEUED"
                         t["message"] = f"进入并发通道 {worker_idx + 1} 准备执行..."
                         task_to_run = t
@@ -418,57 +444,68 @@ async def run_batch_queue(concurrency: int = 2):
             
             if not task_to_run:
                 # 检查是否还有其他通道正在执行未结束的任务
-                has_active = any(t["status"] in ["RUNNING", "QUEUED", "QUEUED_CAPTCHA", "WAITING_CAPTCHA", "WAITING_EMAIL"] for t in tasks)
-                if not has_active:
+                if not active_task_ids:
                     break
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.05)
                 continue
 
-            save_tasks(tasks)
-            await broadcast("TASK_UPDATED", task_to_run)
-            
-            worker = RegisterWorker(cfg, email_svc, log_callback=sync_log_callback, cdp_callback=cdp_callback, captcha_lock=captcha_lock)
-            sync_log_callback(task_to_run["id"], f"并发通道 {worker_idx + 1} 启动执行任务: {task_to_run['email']}", "info")
             try:
+                save_tasks(tasks)
+                await broadcast("TASK_UPDATED", task_to_run)
+                worker = RegisterWorker(cfg, email_svc, log_callback=sync_log_callback, cdp_callback=cdp_callback, captcha_lock=captcha_lock)
                 await worker.execute_task(task_to_run, on_status_change=on_task_status_change)
             except Exception as e:
+                task_to_run["status"] = "FAILED"
+                task_to_run["message"] = f"执行异常: {e}"
+                on_task_status_change(task_to_run)
                 sync_log_callback(task_to_run["id"], f"通道执行异常: {e}", "error")
-            await asyncio.sleep(1)
+            finally:
+                active_task_ids.discard(task_to_run["id"])
 
+    workers = []
+    completed = False
     try:
-        workers = [asyncio.create_task(worker_loop(i)) for i in range(concurrency_limit)]
+        cfg = validated_config(load_config())
+        email_svc = get_email_service()
+        await broadcast("BATCH_STATUS", {"running": True, "concurrency": concurrency})
+        workers = [asyncio.create_task(worker_loop(i)) for i in range(concurrency)]
         await asyncio.gather(*workers)
+        completed = True
     finally:
+        for worker_task in workers:
+            if not worker_task.done():
+                worker_task.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
         is_running_batch = False
-        await broadcast("BATCH_STATUS", {"running": False})
+        batch_queue_task = None
+        running_concurrency = 0
+        scheduled_task_ids.intersection_update(t["id"] for t in tasks if t["status"] == "PENDING")
+        # A request can enqueue work as the last worker exits. Do not strand it.
+        if completed and scheduled_task_ids and not stop_requested:
+            ensure_batch_running(concurrency)
+        await broadcast("BATCH_STATUS", {"running": is_running_batch, "concurrency": running_concurrency})
         sync_log_callback("SYSTEM", "批量注册流水线已结束/暂停", "info")
 
 @app.post("/api/tasks/start")
-async def start_batch_api(data: Dict[str, Any] = Body(default={})):
-    global is_running_batch, stop_requested, batch_queue_task
-    cfg = load_config()
-    concurrency = int(data.get("concurrency") or cfg.get("concurrency") or 2)
+async def start_batch_api(data: Optional[BatchStartRequest] = None):
+    cfg = validated_config(load_config())
+    concurrency = data.concurrency if data and data.concurrency is not None else cfg["concurrency"]
     if cfg.get("concurrency") != concurrency:
         cfg["concurrency"] = concurrency
         save_config(cfg)
 
-    # 将未成功完成的所有任务（失败、排队、中断）全部重置为 PENDING 待办
     for t in tasks:
-        if t["status"] != "SUCCESS":
+        if t["status"] != "SUCCESS" and t["status"] not in ACTIVE_STATUSES and t["id"] not in active_task_ids:
             t["status"] = "PENDING"
             t["message"] = "等待执行"
+            scheduled_task_ids.add(t["id"])
+    if scheduled_task_ids:
+        ensure_batch_running(concurrency)
     save_tasks(tasks)
     await broadcast("TASKS_LOADED", tasks)
 
-    stop_requested = False
-    
-    # 若已经在运行，直接返回成功，后台 worker 会自动拉取刚重置的 PENDING 任务
-    if is_running_batch and batch_queue_task and not batch_queue_task.done():
-        sync_log_callback("SYSTEM", f"流水线运行中，已注入待办任务并刷新并发设置 ({concurrency} 路)", "info")
-        return {"success": True, "message": "流水线运行中，已注入待办任务", "concurrency": concurrency}
-
-    batch_queue_task = asyncio.create_task(run_batch_queue(concurrency))
-    return {"success": True, "concurrency": concurrency}
+    return {"success": True, "concurrency": running_concurrency or concurrency}
 
 @app.post("/api/tasks/pause")
 async def pause_batch_api():
@@ -482,16 +519,15 @@ async def retry_task_api(task_id: str):
     if not target:
         raise HTTPException(status_code=404, detail="Task not found")
         
+    if task_id in active_task_ids or task_id in scheduled_task_ids or target["status"] in ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="任务已在队列中或正在执行")
+    cfg = validated_config(load_config())
     target["status"] = "PENDING"
     target["message"] = "准备重试"
     save_tasks(tasks)
+    scheduled_task_ids.add(task_id)
+    ensure_batch_running(cfg["concurrency"])
     await broadcast("TASK_UPDATED", target)
-    
-    cfg = load_config()
-    email_svc = get_email_service()
-    worker = RegisterWorker(cfg, email_svc, log_callback=sync_log_callback, cdp_callback=cdp_callback, captcha_lock=captcha_lock)
-    
-    asyncio.create_task(worker.execute_task(target, on_status_change=on_task_status_change))
     return {"success": True}
 
 @app.post("/api/tasks/{task_id}/manual-verify")
@@ -618,19 +654,22 @@ async def oauth_cli_start_api(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
         
     poll_token = secrets.token_hex(32)
-    import requests
-    res = requests.post(
-        "https://zcode.z.ai/api/v1/oauth/cli/init",
-        headers={"Authorization": f"Bearer {poll_token}"},
-        json={"provider": "zai"},
-        timeout=10
-    ).json()
+    try:
+        res = await request_json(
+            "POST", "https://zcode.z.ai/api/v1/oauth/cli/init",
+            headers={"Authorization": f"Bearer {poll_token}"},
+            json={"provider": "zai"}, timeout=10,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="无法连接官方 OAuth 服务") from exc
     
-    if res.get("code") != 0 or "data" not in res:
+    if not isinstance(res, dict) or res.get("code") != 0 or not isinstance(res.get("data"), dict):
         return {"success": False, "message": "向官方发起 OAuth 流程失败"}
         
-    flow_id = res["data"]["flow_id"]
-    authorize_url = res["data"]["authorize_url"]
+    flow_id = res["data"].get("flow_id")
+    authorize_url = res["data"].get("authorize_url")
+    if not isinstance(flow_id, str) or not isinstance(authorize_url, str):
+        raise HTTPException(status_code=502, detail="官方 OAuth 响应不完整")
     
     sync_log_callback(task_id, f"已生成官方 OAuth CLI 授权会话，正在等待授权: {target['email']}", "info")
     
@@ -639,11 +678,11 @@ async def oauth_cli_start_api(task_id: str):
         while time.time() - start_t < 300:
             await asyncio.sleep(2)
             try:
-                p_res = requests.get(
-                    f"https://zcode.z.ai/api/v1/oauth/cli/poll/{flow_id}",
+                p_res = await request_json(
+                    "GET", f"https://zcode.z.ai/api/v1/oauth/cli/poll/{flow_id}",
                     headers={"Authorization": f"Bearer {poll_token}"},
                     timeout=10
-                ).json()
+                )
                 p_data = p_res.get("data", {})
                 if p_data.get("status") == "ready" and p_data.get("token"):
                     cli_jwt = p_data["token"]
@@ -678,21 +717,20 @@ async def oauth_cli_start_api(task_id: str):
 @app.get("/api/export-tokens")
 async def export_tokens_txt():
     """Exports tokens.txt format compatible with D3-vin/Zcode2Api (one JWT per line)."""
-    import base64
     current_tasks = load_tasks()
     lines = []
     for t in current_tasks:
         jwt = t.get("cli_jwt") or t.get("jwt")
-        if jwt and "." in jwt:
+        if isinstance(jwt, str) and len(jwt.split(".")) == 3:
             try:
                 # 严格过滤游客 guest token
                 p = jwt.split(".")[1]
-                p += "=" * (4 - len(p) % 4)
+                p += "=" * (-len(p) % 4)
                 data = json.loads(base64.urlsafe_b64decode(p))
-                if "guest-" in str(data.get("email", "")):
+                if not isinstance(data, dict) or str(data.get("email", "")).lower().startswith("guest-"):
                     continue
-            except Exception:
-                pass
+            except (ValueError, TypeError, binascii.Error):
+                continue
             lines.append(jwt)
             
     content = "\n".join(lines)

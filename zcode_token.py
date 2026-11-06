@@ -2,10 +2,10 @@ import base64
 import json
 import uuid
 import secrets
-import requests
 import asyncio
 from typing import Optional, Dict, Any
 from playwright.async_api import async_playwright
+from http_client import request_json
 
 def parse_jwt_sub(token: str) -> str:
     """Extracts sub or user_id or id from JWT payload without verification."""
@@ -48,15 +48,15 @@ async def fetch_zcode_cli_token(page, requests_proxy: Optional[str] = None) -> O
         
     try:
         # 1. Init CLI OAuth
-        init_res = requests.post(
-            "https://zcode.z.ai/api/v1/oauth/cli/init",
+        init_res = await request_json(
+            "POST", "https://zcode.z.ai/api/v1/oauth/cli/init",
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {poll_token}"
             },
             json={"provider": "zai"},
             **req_kwargs
-        ).json()
+        )
         
         if init_res.get("code") != 0 or "data" not in init_res:
             return None
@@ -99,11 +99,11 @@ async def fetch_zcode_cli_token(page, requests_proxy: Optional[str] = None) -> O
             
         # 5. Poll for ready token
         for _ in range(12):
-            poll_res = requests.get(
-                f"https://zcode.z.ai/api/v1/oauth/cli/poll/{flow_id}",
+            poll_res = await request_json(
+                "GET", f"https://zcode.z.ai/api/v1/oauth/cli/poll/{flow_id}",
                 headers={"Authorization": f"Bearer {poll_token}"},
                 **req_kwargs
-            ).json()
+            )
             data = poll_res.get("data", {})
             if data.get("status") == "ready" and data.get("token"):
                 cli_jwt = data["token"]

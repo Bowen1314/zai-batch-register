@@ -78,6 +78,22 @@ def resolve_host(host: str) -> str:
             
     return host
 
+class ResolvedIMAP4SSL(imaplib.IMAP4_SSL):
+    """Connect to a resolved address while verifying the original hostname."""
+
+    def __init__(self, host, port, resolved_host, ssl_context, timeout=15):
+        self.resolved_host = resolved_host
+        super().__init__(host, port, ssl_context=ssl_context, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        sock = socket.create_connection((self.resolved_host, self.port), timeout)
+        try:
+            return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
+
+
 class EmailService:
     def __init__(self, host: str = "", port: int = 993, ssl: bool = True, username: str = "", password: str = "", folder: str = "INBOX"):
         self.host = host.strip()
@@ -92,8 +108,7 @@ class EmailService:
         if self.ssl:
             ctx = ssl.create_default_context()
             if target_host != self.host:
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+                return ResolvedIMAP4SSL(self.host, self.port, target_host, ctx, timeout=15)
             return imaplib.IMAP4_SSL(target_host, self.port, ssl_context=ctx, timeout=15)
         else:
             return imaplib.IMAP4(target_host, self.port, timeout=15)
@@ -134,6 +149,7 @@ class EmailService:
         verify_regex = re.compile(r'https?://chat\.z\.ai/auth/verify_email\?[^\s"\'<>]+')
         
         while time.time() - start_time < timeout:
+            mail = None
             try:
                 mail = self._connect()
                 mail.login(self.username, self.password)
@@ -147,11 +163,18 @@ class EmailService:
                     recent_ids.reverse()
                     
                     for msg_id in recent_ids:
-                        res, data = mail.fetch(msg_id, "(RFC822)")
+                        res, data = mail.fetch(msg_id, "(INTERNALDATE RFC822)")
                         if res != "OK":
                             continue
-                        
-                        raw_email = data[0][1]
+                        entry = next((item for item in data if isinstance(item, tuple) and len(item) == 2), None)
+                        if entry is None:
+                            continue
+                        if since_timestamp:
+                            delivered_at = imaplib.Internaldate2tuple(entry[0])
+                            # INTERNALDATE has second precision. Accept the submission second.
+                            if delivered_at is None or time.mktime(delivered_at) < int(since_timestamp):
+                                continue
+                        raw_email = entry[1]
                         msg = email.message_from_bytes(raw_email)
                         
                         to_addr = decode_mime_words(msg.get("To", "")).lower()
@@ -194,7 +217,6 @@ class EmailService:
                         if header_match or body_match:
                             matches = verify_regex.findall(full_body_raw)
                             if matches:
-                                mail.logout()
                                 return html.unescape(matches[0])
                                 
                         # Fallback: check if verify link specifically has the target email in its query string
@@ -202,12 +224,15 @@ class EmailService:
                         for link in all_links:
                             link_decoded = urllib.parse.unquote(link).lower()
                             if target_clean in link_decoded:
-                                mail.logout()
                                 return html.unescape(link)
-                
-                mail.logout()
             except Exception as e:
                 print(f"[EmailService Error] {e}")
+            finally:
+                if mail is not None:
+                    try:
+                        mail.logout()
+                    except Exception:
+                        pass
             
             time.sleep(poll_interval)
             
