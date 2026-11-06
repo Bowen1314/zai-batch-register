@@ -31,12 +31,14 @@ config = load_config()
 tasks: List[Dict[str, Any]] = load_tasks()
 
 # Automatically recover any tasks left in RUNNING/VERIFYING/QUEUED state from a previous restart
+recovered_tasks = False
 for t in tasks:
-    if t.get("status") in ["RUNNING", "VERIFYING", "WAITING_CAPTCHA", "QUEUED_CAPTCHA", "QUEUED"]:
+    if t.get("status") in ["RUNNING", "VERIFYING", "WAITING_CAPTCHA", "QUEUED_CAPTCHA", "QUEUED", "WAITING_EMAIL"]:
         t["status"] = "PENDING"
         t["message"] = "未完成，已自动重置为待执行"
-save_tasks(tasks)
-save_tasks(tasks)
+        recovered_tasks = True
+if recovered_tasks:
+    save_tasks(tasks)
 
 active_websockets: List[WebSocket] = []
 active_cdp_sessions: Dict[str, Any] = {}
@@ -108,21 +110,19 @@ def generate_random_password(length: int = 14) -> str:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global tasks
     await websocket.accept()
     active_websockets.append(websocket)
-    tasks = load_tasks()
-    await websocket.send_json({"type": "INIT", "tasks": tasks, "config": load_config()})
-    
-    # 若有正在等待滑块验证的任务，立即将状态及最新画面帧同步给新连入的网页（如刷新或新打开的 /verify）
-    for tid in list(active_cdp_sessions.keys()):
-        t = next((x for x in tasks if x["id"] == tid), None)
-        email = t.get("email", "") if t else ""
-        await websocket.send_json({"type": "CAPTCHA_START", "data": {"task_id": tid, "email": email}})
-        if tid in latest_captcha_frames:
-            await websocket.send_json({"type": "CAPTCHA_FRAME", "data": {"task_id": tid, "image": latest_captcha_frames[tid]}})
-    
     try:
+        await websocket.send_json({"type": "INIT", "tasks": tasks, "config": get_masked_config()})
+
+        # Synchronize a new viewer without replacing objects held by active workers.
+        for tid in list(active_cdp_sessions.keys()):
+            t = next((x for x in tasks if x["id"] == tid), None)
+            email = t.get("email", "") if t else ""
+            await websocket.send_json({"type": "CAPTCHA_START", "data": {"task_id": tid, "email": email}})
+            if tid in latest_captcha_frames:
+                await websocket.send_json({"type": "CAPTCHA_FRAME", "data": {"task_id": tid, "image": latest_captcha_frames[tid]}})
+
         while True:
             text = await websocket.receive_text()
             try:
@@ -153,6 +153,8 @@ async def websocket_endpoint(websocket: WebSocket):
             except Exception:
                 pass
     except WebSocketDisconnect:
+        pass
+    finally:
         if websocket in active_websockets:
             active_websockets.remove(websocket)
 
@@ -283,8 +285,6 @@ async def test_email_api(data: Dict[str, Any] = Body(...)):
 
 @app.get("/api/tasks")
 async def get_tasks_api():
-    global tasks
-    tasks = load_tasks()
     return tasks
 
 class BatchAddRequest(BaseModel):

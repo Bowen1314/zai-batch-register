@@ -18,6 +18,7 @@ tokens.txt
 *.jpg
 *.jpeg
 test_*.py
+!tests/test_*.py
 inspect_*.py
 
 # System & IDE
